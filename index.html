@@ -1,1 +1,399 @@
 
+"""
+Оплот: базовый защищённый сайт на Flask (один файл).
+
+Запуск:
+    pip install flask flask-limiter
+    export SECRET_KEY="длинная-случайная-строка"   # обязательно в продакшене
+    python app.py                                   # http://localhost:5000
+
+Продакшен:
+    gunicorn -w 4 -b 127.0.0.1:8000 app:app   (за nginx + HTTPS + Cloudflare)
+    Для лимитов между воркерами укажите Redis: RATELIMIT_STORAGE_URI=redis://localhost:6379
+"""
+import hashlib
+import json
+import os
+import re
+import secrets
+import time
+
+from flask import Flask, abort, g, jsonify, render_template_string, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# ───────────────────────── Настройки ─────────────────────────
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+POW_DIFFICULTY = 4          # число нулевых hex-символов (4 ≈ 65 тыс. попыток ≈ 1–3 сек)
+POW_MAX_AGE = 600           # задача действительна 10 минут
+POW_MIN_AGE = 2             # быстрее 2 сек человек форму не отправит
+BAN_SECONDS = 600           # бан IP после повторных нарушений
+STRIKES_TO_BAN = 5
+
+# ИИ-краулеры, скрейперы и инструменты автоматизации (по User-Agent).
+# Это защита от «вежливых» ботов: подделать User-Agent легко.
+BAD_UA = re.compile(
+    r"GPTBot|ChatGPT|OAI-SearchBot|ClaudeBot|Claude-Web|anthropic|CCBot|PerplexityBot|"
+    r"Google-Extended|Bytespider|Amazonbot|Applebot-Extended|cohere|Meta-External|"
+    r"FacebookBot|Diffbot|ImagesiftBot|Omgili|YouBot|AI2Bot|Timpibot|PetalBot|"
+    r"python-requests|aiohttp|httpx|curl|wget|scrapy|libwww|Go-http-client|"
+    r"okhttp|Java/|HeadlessChrome|PhantomJS|selenium|puppeteer|playwright|"
+    r"AhrefsBot|SemrushBot|MJ12bot|DotBot|BLEXBot",
+    re.I,
+)
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    MAX_CONTENT_LENGTH=16 * 1024,  # тело запроса не больше 16 КБ
+)
+# Если стоите за одним прокси (nginx/Cloudflare), берём настоящий IP из X-Forwarded-For.
+# Без прокси УДАЛИТЕ эту строку, иначе IP можно подделать.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["120 per minute", "2000 per hour"],
+    storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
+)
+
+signer = URLSafeTimedSerializer(SECRET_KEY, salt="pow-v1")
+used_challenges: dict[str, float] = {}
+strikes: dict[str, int] = {}
+banned: dict[str, float] = {}
+
+
+def strike(ip: str) -> None:
+    strikes[ip] = strikes.get(ip, 0) + 1
+    if strikes[ip] >= STRIKES_TO_BAN:
+        banned[ip] = time.time() + BAN_SECONDS
+        strikes.pop(ip, None)
+
+
+def purge() -> None:
+    now = time.time()
+    for k in [k for k, v in used_challenges.items() if v < now]:
+        used_challenges.pop(k, None)
+    for k in [k for k, v in banned.items() if v < now]:
+        banned.pop(k, None)
+
+
+# ───────────────────────── Защитный слой ─────────────────────────
+@app.before_request
+def guard():
+    g.nonce = secrets.token_urlsafe(16)
+    ip = get_remote_address()
+    if banned.get(ip, 0) > time.time():
+        abort(403)
+    if request.method not in ("GET", "HEAD", "POST"):
+        abort(405)
+    if request.path == "/robots.txt":
+        return
+    ua = request.headers.get("User-Agent", "")
+    if len(ua) < 10 or BAD_UA.search(ua):
+        strike(ip)
+        abort(403)
+    if not request.headers.get("Accept-Language"):  # у браузеров он есть почти всегда
+        strike(ip)
+        abort(403)
+
+
+@app.after_request
+def headers(resp):
+    n = getattr(g, "nonce", "")
+    resp.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; script-src 'nonce-{n}'; style-src 'nonce-{n}'; "
+        "connect-src 'self'; img-src 'self' data:; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    )
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    resp.headers["X-Robots-Tag"] = "noai, noimageai"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.errorhandler(429)
+def too_many(_e):
+    strike(get_remote_address())
+    return jsonify(error="Слишком много запросов. Подождите минуту."), 429
+
+
+@app.errorhandler(403)
+def forbidden(_e):
+    return jsonify(error="Доступ запрещён."), 403
+
+
+@app.errorhandler(413)
+def too_big(_e):
+    return jsonify(error="Слишком большой запрос."), 413
+
+
+# ───────────────────────── Proof-of-Work ─────────────────────────
+@app.get("/api/challenge")
+@limiter.limit("20 per minute")
+def challenge():
+    purge()
+    c = secrets.token_hex(12)
+    token = signer.dumps({"c": c, "t": time.time(), "d": POW_DIFFICULTY})
+    return jsonify(token=token, c=c, d=POW_DIFFICULTY)
+
+
+def verify_pow(token: str, nonce: str) -> bool:
+    if not (token and nonce.isdigit() and len(nonce) <= 12):
+        return False
+    try:
+        data = signer.loads(token, max_age=POW_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    if time.time() - data["t"] < POW_MIN_AGE or data["c"] in used_challenges:
+        return False
+    digest = hashlib.sha256(f'{data["c"]}:{nonce}'.encode()).hexdigest()
+    if not digest.startswith("0" * data["d"]):
+        return False
+    used_challenges[data["c"]] = time.time() + POW_MAX_AGE  # одноразовая
+    return True
+
+
+# ───────────────────────── Маршруты ─────────────────────────
+@app.get("/robots.txt")
+def robots():
+    agents = ["GPTBot", "ChatGPT-User", "OAI-SearchBot", "ClaudeBot", "anthropic-ai",
+              "CCBot", "PerplexityBot", "Google-Extended", "Bytespider", "Amazonbot",
+              "Applebot-Extended", "cohere-ai", "Meta-ExternalAgent", "Diffbot"]
+    body = "".join(f"User-agent: {a}\nDisallow: /\n\n" for a in agents)
+    return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.post("/api/contact")
+@limiter.limit("5 per minute; 30 per hour")
+def contact():
+    f = request.form
+    if f.get("website"):  # ловушка для ботов: человек это поле не видит
+        strike(get_remote_address())
+        return jsonify(ok=True)  # делаем вид, что всё прошло
+    if not verify_pow(f.get("token", ""), f.get("nonce", "")):
+        strike(get_remote_address())
+        return jsonify(error="Проверка не пройдена. Обновите страницу."), 400
+    name = f.get("name", "").strip()
+    email = f.get("email", "").strip()
+    text = f.get("message", "").strip()
+    if not (1 <= len(name) <= 80 and 3 <= len(text) <= 2000
+            and re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}", email)):
+        return jsonify(error="Проверьте поля: имя, почта и сообщение."), 400
+    with open("messages.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"t": time.time(), "name": name, "email": email,
+                             "message": text}, ensure_ascii=False) + "\n")
+    return jsonify(ok=True)
+
+
+@app.get("/")
+def index():
+    return render_template_string(PAGE, nonce=g.nonce)
+
+
+# ───────────────────────── Интерфейс ─────────────────────────
+PAGE = r'''<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noai, noimageai">
+<title>Оплот: сайт под защитой</title>
+<style nonce="{{ nonce }}">
+:root{
+  --paper:#EAF0F6; --ink:#12213B; --steel:#55657E; --line:#C9D4E2;
+  --signal:#2A55F0; --amber:#F2A516; --panel:#FFFFFF; --ok:#12805C;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.6 var(--sans)}
+a{color:var(--signal)}
+:focus-visible{outline:3px solid var(--signal);outline-offset:3px;border-radius:4px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+header{padding:22px 0;display:flex;justify-content:space-between;align-items:center}
+.logo{font:700 22px var(--serif);letter-spacing:.2px}
+nav a{margin-left:22px;color:var(--steel);text-decoration:none;font-weight:500}
+nav a:hover{color:var(--ink)}
+.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:56px;align-items:center;padding:56px 0 72px}
+h1{font:700 clamp(36px,5.4vw,62px)/1.06 var(--serif);margin:0 0 22px;letter-spacing:-.5px}
+.lead{max-width:46ch;color:var(--steel);font-size:19px;margin:0 0 28px}
+.btn{display:inline-block;background:var(--ink);color:#fff;border:0;border-radius:10px;
+  padding:14px 26px;font:600 16px var(--sans);cursor:pointer;text-decoration:none;
+  transition:background .2s,transform .1s}
+.btn:hover{background:var(--signal)}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{background:var(--line);color:var(--steel);cursor:not-allowed}
+
+/* Главный элемент: живая проверка */
+.gate{background:var(--panel);border:1px solid var(--line);border-radius:22px;
+  padding:34px;text-align:center;box-shadow:0 18px 50px -24px rgba(18,33,59,.35)}
+.ring{width:176px;height:176px;margin:0 auto 18px;position:relative}
+.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring circle{fill:none;stroke-width:10;stroke-linecap:round}
+.ring .bg{stroke:var(--line)}
+.ring .fg{stroke:var(--amber);stroke-dasharray:439.8;stroke-dashoffset:439.8;transition:stroke-dashoffset .25s linear,stroke .4s}
+.ring .mark{position:absolute;inset:0;display:grid;place-items:center;font:700 34px var(--serif)}
+.gate.done .fg{stroke:var(--ok);stroke-dashoffset:0}
+.gate h2{font:700 22px var(--serif);margin:0 0 6px}
+.gate p{margin:0;color:var(--steel);font-size:15px}
+
+section{padding:64px 0;border-top:1px solid var(--line)}
+section h2.t{font:700 34px/1.15 var(--serif);margin:0 0 28px}
+.layers{margin:0;padding:0;list-style:none;max-width:760px}
+.layers li{padding:20px 0 20px 22px;border-left:4px solid var(--signal);margin-bottom:14px;
+  background:linear-gradient(90deg,rgba(42,85,240,.06),transparent 70%)}
+.layers b{display:block;font:700 19px var(--serif);margin-bottom:2px}
+.layers span{color:var(--steel)}
+
+form{max-width:560px;display:grid;gap:16px}
+label{display:grid;gap:6px;font-weight:600;font-size:15px}
+input,textarea{font:inherit;padding:13px 14px;border:1.5px solid var(--line);border-radius:10px;
+  background:#fff;color:var(--ink);width:100%}
+input:focus,textarea:focus{border-color:var(--signal);outline:none;box-shadow:0 0 0 3px rgba(42,85,240,.18)}
+textarea{min-height:130px;resize:vertical}
+.hp{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+#msg{min-height:24px;font-weight:600}
+#msg.err{color:#B42318}#msg.ok{color:var(--ok)}
+footer{padding:36px 0 56px;color:var(--steel);font-size:14px;border-top:1px solid var(--line)}
+
+@media (max-width:820px){
+  .hero{grid-template-columns:1fr;gap:36px;padding-top:24px}
+  nav{display:none}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">Оплот</div>
+    <nav><a href="#layers">Защита</a><a href="#contact">Связаться</a></nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <div>
+        <h1>Сайт, который отличает людей от скриптов</h1>
+        <p class="lead">Заходите спокойно: проверка идёт в фоне. Боты, парсеры и перегрузка запросами упираются в несколько слоёв защиты ещё до контента.</p>
+        <a class="btn" href="#contact">Написать нам</a>
+      </div>
+      <div class="gate" id="gate" role="status" aria-live="polite">
+        <div class="ring">
+          <svg viewBox="0 0 160 160" aria-hidden="true">
+            <circle class="bg" cx="80" cy="80" r="70"/>
+            <circle class="fg" id="fg" cx="80" cy="80" r="70"/>
+          </svg>
+          <div class="mark" id="mark">…</div>
+        </div>
+        <h2 id="gtitle">Проверяем браузер</h2>
+        <p id="gtext">Решаем небольшую задачу. Это займёт пару секунд.</p>
+      </div>
+    </div>
+
+    <section id="layers">
+      <h2 class="t">Что стоит между сайтом и ботами</h2>
+      <ul class="layers">
+        <li><b>Ограничение частоты</b><span>Лимиты на IP, временный бан за повторные нарушения.</span></li>
+        <li><b>Вычислительная проверка</b><span>Каждая форма требует решённой задачи: одному человеку это незаметно, а массовой рассылке дорого.</span></li>
+        <li><b>Фильтр ИИ-краулеров и скрейперов</b><span>Блокировка по User-Agent, robots.txt и заголовки noai.</span></li>
+        <li><b>Жёсткие заголовки</b><span>CSP с одноразовыми nonce, запрет встраивания, HSTS.</span></li>
+        <li><b>Ловушка для ботов</b><span>Скрытое поле, которое заполняют только скрипты.</span></li>
+      </ul>
+    </section>
+
+    <section id="contact">
+      <h2 class="t">Написать нам</h2>
+      <form id="form" novalidate>
+        <label>Имя <input name="name" maxlength="80" autocomplete="name" required></label>
+        <label>Почта <input name="email" type="email" maxlength="200" autocomplete="email" required></label>
+        <label>Сообщение <textarea name="message" maxlength="2000" required></textarea></label>
+        <div class="hp" aria-hidden="true"><label>Сайт <input name="website" tabindex="-1" autocomplete="off"></label></div>
+        <button class="btn" id="send" type="submit" disabled>Отправить сообщение</button>
+        <div id="msg" role="status"></div>
+      </form>
+    </section>
+  </main>
+
+  <footer>© Оплот. Замените название, тексты и цвета под свой проект.</footer>
+</div>
+
+<script nonce="{{ nonce }}">
+(() => {
+  const $ = id => document.getElementById(id);
+  const gate = $('gate'), fg = $('fg'), send = $('send'), msg = $('msg');
+  const CIRC = 439.8;
+  let token = null, nonceVal = null;
+
+  async function solve() {
+    if (!window.crypto || !crypto.subtle) {
+      $('gtitle').textContent = 'Нужен HTTPS';
+      $('gtext').textContent = 'Проверка работает только на защищённом соединении.';
+      return;
+    }
+    const ch = await (await fetch('/api/challenge', {cache: 'no-store'})).json();
+    token = ch.token;
+    const enc = new TextEncoder();
+    const expected = Math.pow(16, ch.d);
+    const prefix = '0'.repeat(ch.d);
+    let n = 0;
+    for (;;) {
+      for (let i = 0; i < 400; i++, n++) {
+        const buf = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(ch.c + ':' + n)));
+        let hex = '';
+        for (let k = 0; k < 4; k++) hex += buf[k].toString(16).padStart(2, '0');
+        if (hex.startsWith(prefix)) { nonceVal = String(n); return finish(); }
+      }
+      const p = Math.min(0.94, n / expected);
+      fg.style.strokeDashoffset = CIRC * (1 - p);
+      await new Promise(r => setTimeout(r));
+    }
+  }
+
+  function finish() {
+    gate.classList.add('done');
+    $('mark').textContent = '✓';
+    $('gtitle').textContent = 'Проверка пройдена';
+    $('gtext').textContent = 'Вы можете отправлять сообщения.';
+    send.disabled = false;
+  }
+
+  $('form').addEventListener('submit', async e => {
+    e.preventDefault();
+    msg.className = ''; msg.textContent = '';
+    const fd = new FormData(e.target);
+    fd.set('token', token); fd.set('nonce', nonceVal);
+    send.disabled = true;
+    try {
+      const r = await fetch('/api/contact', {method: 'POST', body: fd});
+      const j = await r.json();
+      if (r.ok && j.ok) {
+        msg.className = 'ok'; msg.textContent = 'Сообщение отправлено.'; e.target.reset();
+      } else {
+        msg.className = 'err'; msg.textContent = j.error || 'Не удалось отправить.';
+      }
+    } catch { msg.className = 'err'; msg.textContent = 'Нет связи с сервером.'; }
+    // каждая отправка требует новой проверки
+    gate.classList.remove('done'); fg.style.strokeDashoffset = CIRC;
+    $('mark').textContent = '…'; $('gtitle').textContent = 'Проверяем браузер';
+    $('gtext').textContent = 'Решаем небольшую задачу. Это займёт пару секунд.';
+    solve();
+  });
+
+  solve();
+})();
+</script>
+</body>
+</html>'''
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
